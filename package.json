@@ -1,0 +1,44 @@
+{
+  "name": "tenderintel",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
+    "db:migrate": "node scripts/migrate.js",
+    "seed:wiki": "node scripts/seedWiki.mjs"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@supabase/supabase-js": "^2.45.0",
+    "@supabase/ssr": "^0.5.0",
+    "openai": "^4.67.0",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.8.0",
+    "xlsx": "^0.18.5",
+    "p-limit": "^5.0.0",
+    "date-fns": "^3.6.0",
+    "zod": "^3.23.8",
+    "lucide-react": "^0.460.0",
+    "clsx": "^2.1.1",
+    "marked": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "@types/pdf-parse": "^1.1.4",
+    "pg": "^8.13.0",
+    "typescript": "^5",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.5",
+    "tailwindcss": "^3.4.0",
+    "@tailwindcss/typography": "^0.5.15",
+    "postcss": "^8",
+    "autoprefixer": "^10"
+  }
+}
