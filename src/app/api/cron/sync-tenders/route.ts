@@ -456,7 +456,9 @@ interface DocCandidate {
  * into `tender_documents` (ON CONFLICT (tender_id, source_url) DO NOTHING).
  * Returns the number of newly-queued documents.
  */
-async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number }> {
+async function runDocuments(
+  supabase: SupabaseClient,
+): Promise<{ queued: number; scanned: number }> {
   const { data, error } = await supabase
     .from("tenders")
     .select("tender_id, ocds_data")
@@ -469,10 +471,13 @@ async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number 
   for (const row of data ?? []) {
     const tenderId = row.tender_id as string;
     const ocds = (row.ocds_data ?? {}) as Release;
-    const tenderDocs = ocds.tender?.documents ?? [];
-    const awardDocs = ocds.awards?.[0]?.documents ?? [];
+    const docs: Document[] = [
+      ...(ocds.tender?.documents ?? []),
+      ...(ocds.awards ?? []).flatMap((a) => a.documents ?? []),
+      ...(ocds.contracts ?? []).flatMap((c) => c.documents ?? []),
+    ];
 
-    for (const doc of [...tenderDocs, ...awardDocs]) {
+    for (const doc of docs) {
       if (!doc?.url) continue;
       const key = `${tenderId} ${doc.url}`;
       if (candidates.has(key)) continue;
@@ -487,7 +492,8 @@ async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number 
   }
 
   const rows = [...candidates.values()];
-  if (rows.length === 0) return { queued: 0 };
+  const scanned = rows.length;
+  if (scanned === 0) return { queued: 0, scanned: 0 };
 
   // Determine which (tender_id, source_url) pairs already exist so we can report
   // an accurate count of *newly* queued documents.
@@ -507,7 +513,7 @@ async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number 
     (r) => !existing.has(`${r.tender_id} ${r.source_url}`),
   );
 
-  if (newRows.length === 0) return { queued: 0 };
+  if (newRows.length === 0) return { queued: 0, scanned };
 
   // Plain insert of the already-deduped new rows. We intentionally do NOT use
   // ON CONFLICT here: the only guaranteed unique index is (tender_id,
@@ -528,7 +534,7 @@ async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number 
     inserted += part.length;
   }
 
-  return { queued: inserted };
+  return { queued: inserted, scanned };
 }
 
 // ── Route handler ───────────────────────────────────────────────────────────
@@ -639,8 +645,15 @@ export async function GET(req: NextRequest) {
         break;
       }
       case "documents": {
+        await writeCursor(supabase, "documents", { status: "running" });
         const r = await runDocuments(supabase);
         queued = r.queued;
+        extra = { scanned: r.scanned };
+        await writeCursor(supabase, "documents", {
+          last_synced_date: new Date().toISOString(),
+          total_records: r.scanned,
+          status: "completed",
+        });
         break;
       }
     }
