@@ -17,7 +17,7 @@ export const maxDuration = 300;
 /** Per-run safety caps so a single invocation stays under the 300s task timeout. */
 const INCREMENTAL_MAX_PAGES = 10; // ~5000 records
 const BACKFILL_MAX_PAGES = 20; // ~10000 records
-const BACKFILL_WINDOW_MONTHS = 1;
+const BACKFILL_WINDOW_MONTHS = 3;
 const OCDS_FULL_WINDOW_MONTHS = 3;
 const BACKFILL_EPOCH = "2015-01-01T00:00:00Z";
 const CAUGHT_UP_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — incremental takes over
@@ -214,16 +214,18 @@ async function runIncremental(
   awardedOnly: boolean,
 ): Promise<RunStats> {
   const cursor = await readCursor(supabase, cursorMode);
-  const dateFrom = cursor?.last_synced_date
-    ? toOCDSDate(new Date(cursor.last_synced_date))
-    : undefined;
+  // OCDS requires both bounds: dateFrom = cursor high-water mark, dateTo = today.
+  const dateFrom = toOCDSDate(
+    cursor?.last_synced_date ? new Date(cursor.last_synced_date) : new Date("2020-01-01T00:00:00Z"),
+  );
+  const dateTo = toOCDSDate(new Date());
 
   await writeCursor(supabase, cursorMode, { status: "running" });
 
   const stats: RunStats = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0 };
 
   for (let page = 1; page <= maxPages; page++) {
-    const pkg = await fetchOCDSPage(page, dateFrom);
+    const pkg = await fetchOCDSPage(page, dateFrom, dateTo);
     const releases = pkg.releases;
     if (releases.length === 0) break;
     stats.pages += 1;

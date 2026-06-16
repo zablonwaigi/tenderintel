@@ -153,8 +153,12 @@ export async function fetchOCDSPage(
     PageNumber: String(pageNumber),
     PageSize: String(PAGE_SIZE),
   });
-  if (dateFrom) params.set("dateFrom", dateFrom);
-  if (dateTo) params.set("dateTo", dateTo);
+  // The eTenders OCDS API requires BOTH dateFrom and dateTo — omitting either
+  // returns 400 "dateFrom and dateTo fields are required." Default to a wide
+  // window so a bare call still succeeds.
+  const today = new Date().toISOString().split("T")[0]; // 'YYYY-MM-DD'
+  params.set("dateFrom", dateFrom || "2020-01-01");
+  params.set("dateTo", dateTo || today);
 
   const res = await fetch(`${OCDS_BASE}/api/OCDSReleases?${params}`, {
     headers: { Accept: "application/json" },

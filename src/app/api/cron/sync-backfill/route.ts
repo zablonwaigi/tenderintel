@@ -12,7 +12,7 @@ export const maxDuration = 300;
  *
  *   GET /api/cron/sync-backfill?from=2015-01-01&to=2026-06-01
  *
- * Processes exactly ONE month window per invocation (staying well under the
+ * Processes exactly ONE 3-month window per invocation (staying well under the
  * 300s task timeout), persists progress in `ocds_sync_cursor` under the
  * `backfill-init` mode, and returns where the next call should resume so a
  * caller can chain invocations until `done` is true.
@@ -22,7 +22,7 @@ export const maxDuration = 300;
 
 const CURSOR_MODE = "backfill-init";
 const DEFAULT_FROM = "2015-01-01";
-const WINDOW_MONTHS = 1;
+const WINDOW_MONTHS = 3;
 const MAX_PAGES = 20;
 
 function parseDate(value: string | null, fallback: Date): Date {
