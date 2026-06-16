@@ -61,6 +61,7 @@ environment variable. Each task command therefore sends:
 | `sync-tenders` | Daily 06:00 | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=incremental" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-awarded` | Mon 07:00 | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=awarded" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-documents` | Every 4 hours | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=documents" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
+| `sync-downloads` | Hourly | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=download" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-ocds-full` | 1st of month 02:00 | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=backfill" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-backfill-init` | Manual / run-once | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-backfill?from=2015-01-01&to=2026-06-01" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 
@@ -90,10 +91,17 @@ runs.
   `?reset=true` to deliberately restart history from `2015-01-01`.
 - **`status`** — read-only diagnostics: returns `tenders`/`documents` counts and
   every sync cursor. Writes nothing.
-- **`documents`** — scans recently-synced tenders for OCDS document URLs in
-  `ocds_data->'tender'->'documents'` and `ocds_data->'awards'->0->'documents'`,
-  queueing new rows into `tender_documents`
-  (`ON CONFLICT (tender_id, source_url) DO NOTHING`).
+- **`documents`** — walks the **entire** tenders table (paged) and queues OCDS
+  document URLs from `tender.documents[]`, `awards[*].documents[]` and
+  `contracts[*].documents[]` into `tender_documents` as `download_status='pending'`.
+  De-duped against existing rows, so it is idempotent and safe to re-run.
+  Returns `{ queued, scanned }`.
+- **`download`** — fetches up to `DOWNLOAD_BATCH` (200, override with `?limit=`)
+  pending documents into the private Supabase Storage bucket via the
+  `DocumentDownloader` (10-way concurrency, 3 retries, Referer set for
+  etenders.gov.za), flipping each row to `downloaded`/`failed`. Schedule it
+  hourly so it drains the backlog and keeps up with newly-queued documents.
+  Returns `{ downloaded, failed, processed }`.
 
 ## One-time historical backfill
 

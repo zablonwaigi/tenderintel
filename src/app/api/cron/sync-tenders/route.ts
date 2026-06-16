@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { SupabaseClient } from "@supabase/supabase-js";
 import { isAuthorized } from "@/lib/auth";
 import { createServiceClient } from "@/lib/supabase/server";
+import { DocumentDownloader } from "@/lib/pipeline/documentDownloader";
 import {
   fetchOCDSPage,
   toOCDSDate,
@@ -21,12 +22,17 @@ const BACKFILL_WINDOW_MONTHS = 3;
 const OCDS_FULL_WINDOW_MONTHS = 3;
 const BACKFILL_EPOCH = "2015-01-01T00:00:00Z";
 const CAUGHT_UP_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — incremental takes over
+// Default number of pending documents to fetch into storage per `download` run.
+// Bounded to stay under the 300s task timeout; schedule the task frequently to
+// drain the backlog and keep up with newly-queued documents.
+const DOWNLOAD_BATCH = 200;
 
 const VALID_MODES = [
   "incremental",
   "backfill",
   "awarded",
   "documents",
+  "download",
   "ocds-full",
   "status",
 ] as const;
@@ -459,25 +465,33 @@ interface DocCandidate {
 async function runDocuments(
   supabase: SupabaseClient,
 ): Promise<{ queued: number; scanned: number }> {
-  const { data, error } = await supabase
-    .from("tenders")
-    .select("tender_id, ocds_data")
-    .not("ocds_data", "is", null)
-    .order("last_ocds_sync", { ascending: false, nullsFirst: false })
-    .limit(2000);
-  if (error) throw new Error(`tenders query failed: ${error.message}`);
-
   const candidates = new Map<string, DocCandidate>();
-  for (const row of data ?? []) {
-    const tenderId = row.tender_id as string;
-    const ocds = (row.ocds_data ?? {}) as Release;
-    const docs: Document[] = [
-      ...(ocds.tender?.documents ?? []),
-      ...(ocds.awards ?? []).flatMap((a) => a.documents ?? []),
-      ...(ocds.contracts ?? []).flatMap((c) => c.documents ?? []),
-    ];
 
-    for (const doc of docs) {
+  // Walk the ENTIRE tenders table (paged) so documents for every tender get
+  // queued — not just the most-recent page. Ordered by the unique tender_id so
+  // range pagination is stable. Already-queued rows are de-duped before insert,
+  // so re-scanning on each run is cheap and idempotent.
+  const BATCH = 1000;
+  for (let offset = 0; ; offset += BATCH) {
+    const { data, error } = await supabase
+      .from("tenders")
+      .select("tender_id, ocds_data")
+      .not("ocds_data", "is", null)
+      .order("tender_id", { ascending: true })
+      .range(offset, offset + BATCH - 1);
+    if (error) throw new Error(`tenders query failed: ${error.message}`);
+
+    const batch = data ?? [];
+    for (const row of batch) {
+      const tenderId = row.tender_id as string;
+      const ocds = (row.ocds_data ?? {}) as Release;
+      const docs: Document[] = [
+        ...(ocds.tender?.documents ?? []),
+        ...(ocds.awards ?? []).flatMap((a) => a.documents ?? []),
+        ...(ocds.contracts ?? []).flatMap((c) => c.documents ?? []),
+      ];
+
+      for (const doc of docs) {
       if (!doc?.url) continue;
       const key = `${tenderId} ${doc.url}`;
       if (candidates.has(key)) continue;
@@ -488,7 +502,10 @@ async function runDocuments(
         file_type: fileTypeFromUrl(doc.url, doc.format),
         download_status: "pending",
       });
+      }
     }
+
+    if (batch.length < BATCH) break;
   }
 
   const rows = [...candidates.values()];
@@ -592,6 +609,8 @@ export async function GET(req: NextRequest) {
 
   let stats: RunStats = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0 };
   let queued = 0;
+  let downloaded = 0;
+  let failed = 0;
   let extra: Record<string, unknown> = {};
   let error: Error | null = null;
 
@@ -656,6 +675,25 @@ export async function GET(req: NextRequest) {
         });
         break;
       }
+      case "download": {
+        await writeCursor(supabase, "download", { status: "running" });
+        const limitParam = Number(req.nextUrl.searchParams.get("limit"));
+        const limit =
+          Number.isFinite(limitParam) && limitParam > 0
+            ? Math.min(1000, Math.floor(limitParam))
+            : DOWNLOAD_BATCH;
+        const downloader = new DocumentDownloader(supabase);
+        const r = await downloader.downloadPending(limit);
+        downloaded = r.downloaded;
+        failed = r.failed;
+        extra = { downloaded: r.downloaded, failed: r.failed, processed: r.processed };
+        await writeCursor(supabase, "download", {
+          last_synced_date: new Date().toISOString(),
+          total_records: r.downloaded,
+          status: "completed",
+        });
+        break;
+      }
     }
   } catch (err) {
     error = err instanceof Error ? err : new Error(String(err));
@@ -667,7 +705,11 @@ export async function GET(req: NextRequest) {
 
   // Always record the run.
   const runType =
-    mode === "incremental" ? "incremental" : mode === "documents" ? "documents" : "full";
+    mode === "incremental"
+      ? "incremental"
+      : mode === "documents" || mode === "download"
+        ? "documents"
+        : "full";
   try {
     await supabase.from("ingestion_log").insert({
       run_type: runType,
@@ -676,6 +718,8 @@ export async function GET(req: NextRequest) {
       tenders_new: stats.newCount,
       tenders_updated: stats.updatedCount,
       docs_queued: queued,
+      docs_downloaded: downloaded,
+      docs_failed: failed,
       error_message: error?.message || null,
       started_at: startTime.toISOString(),
       completed_at: new Date().toISOString(),

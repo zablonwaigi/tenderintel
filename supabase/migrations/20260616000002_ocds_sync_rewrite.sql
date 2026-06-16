@@ -66,7 +66,8 @@ values
   ('incremental', '2020-01-01T00:00:00Z'),
   ('backfill',    '2015-01-01T00:00:00Z'),
   ('awarded',     '2020-01-01T00:00:00Z'),
-  ('documents',   null)
+  ('documents',   null),
+  ('download',    null)
 on conflict (sync_mode) do nothing;
 
 -- ── RLS: service role full access ───────────────────────────────────────────
