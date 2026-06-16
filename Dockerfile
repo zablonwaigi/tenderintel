@@ -14,6 +14,7 @@ RUN npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
+RUN apk add --no-cache wget
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 
