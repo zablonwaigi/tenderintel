@@ -25,7 +25,5 @@ COPY --from=builder /app/.next/static ./.next/static
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
-  CMD wget -qO- http://localhost:3000/api/health || exit 1
 
 CMD ["node", "server.js"]
