@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
-import { startRun, executeRun, type PipelineMode } from "@/lib/pipeline/runner";
+import { startRun, executeRun, PIPELINE_MODES, type PipelineMode } from "@/lib/pipeline/runner";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-const VALID_MODES: PipelineMode[] = ["full", "incremental", "documents", "ocds"];
+const VALID_MODES: PipelineMode[] = PIPELINE_MODES;
 
 export async function POST(req: NextRequest) {
   if (!isAuthorized(req)) {

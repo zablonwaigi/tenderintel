@@ -6,12 +6,24 @@ import type { TenderStatus } from "@/types/tender";
 const PORTAL_BASE = "https://www.etenders.gov.za";
 const PAGINATED_ENDPOINT = "/Home/PaginatedTenderOpportunities";
 const PAGE_SIZE = 1000;
+const MAX_RETRIES = 3;
+const PAGE_PAUSE_MS = 300;
 
 const STATUS_MAP: Record<number, TenderStatus> = {
   1: "active",
   2: "awarded",
   4: "closed",
 };
+
+// Map a portal StatusId to our internal status, falling back to 'closed'
+// for any unexpected id so ingestion never aborts on a new status value.
+function statusFromId(statusId: number): TenderStatus {
+  return STATUS_MAP[statusId] ?? "closed";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 interface PortalDocument {
   FileName?: string;
@@ -99,23 +111,39 @@ export class PortalIngester {
       searchPhrase: "",
     });
 
-    const res = await fetch(`${PORTAL_BASE}${PAGINATED_ENDPOINT}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Requested-With": "XMLHttpRequest",
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json, text/javascript, */*; q=0.01",
-      },
-      body: body.toString(),
-    });
+    // Retry transient failures with exponential backoff so a single network
+    // blip doesn't abort the whole run.
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(`${PORTAL_BASE}${PAGINATED_ENDPOINT}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            Accept: "application/json, text/javascript, */*; q=0.01",
+          },
+          body: body.toString(),
+        });
 
-    if (!res.ok) {
-      throw new Error(`Portal API returned ${res.status} ${res.statusText} for start=${start}`);
+        if (!res.ok) {
+          throw new Error(`Portal API returned ${res.status} ${res.statusText} for start=${start}`);
+        }
+
+        const json = (await res.json()) as { data?: PortalRecord[] };
+        return Array.isArray(json.data) ? json.data : [];
+      } catch (err) {
+        lastError = err;
+        if (attempt < MAX_RETRIES - 1) await sleep(2000 * (attempt + 1));
+      }
     }
 
-    const json = (await res.json()) as { data?: PortalRecord[] };
-    return Array.isArray(json.data) ? json.data : [];
+    throw new Error(
+      `Portal API failed after ${MAX_RETRIES} attempts for start=${start}: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`
+    );
   }
 
   /**
@@ -130,10 +158,7 @@ export class PortalIngester {
       return { inserted: 0, updated: 0, documentsQueued: 0, fetched: 0 };
     }
 
-    const status = STATUS_MAP[statusId];
-    if (!status) {
-      throw new Error(`Unsupported statusId: ${statusId}`);
-    }
+    const status = statusFromId(statusId);
 
     let start = 0;
     let page = 0;
@@ -151,11 +176,15 @@ export class PortalIngester {
       result.fetched += records.length;
 
       if (onProgress) onProgress(result.fetched);
+      console.log(
+        `[portal:${status}] page ${page + 1} — fetched ${records.length} (total ${result.fetched})`
+      );
 
       start += PAGE_SIZE;
       page += 1;
       if (maxPages && page >= maxPages) break;
       if (records.length < PAGE_SIZE) break;
+      await sleep(PAGE_PAUSE_MS); // be polite to the portal between pages
     }
 
     return result;
