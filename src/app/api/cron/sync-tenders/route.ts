@@ -28,8 +28,17 @@ const VALID_MODES = [
   "awarded",
   "documents",
   "ocds-full",
+  "status",
 ] as const;
 type SyncMode = (typeof VALID_MODES)[number];
+
+// Legacy task commands may still hit removed modes. Map them to a sane modern
+// equivalent so a stale Coolify task degrades gracefully instead of 400-ing.
+const LEGACY_ALIASES: Record<string, SyncMode> = {
+  closed: "incremental",
+  ocds: "incremental",
+  full: "backfill",
+};
 
 // ── OCDS release → tenders row mapping ──────────────────────────────────────
 
@@ -250,68 +259,167 @@ async function runIncremental(
   return stats;
 }
 
+export interface BackfillOptions {
+  cursorMode: string;
+  windowMonths: number;
+  maxPages: number;
+  /** Hard lower bound; the cursor is never rewound earlier than this. */
+  rangeStart?: Date;
+  /** Hard upper bound. Defaults to (now - 30 days) so incremental owns recent. */
+  rangeEnd?: Date;
+}
+
+export interface BackfillResult extends RunStats {
+  done: boolean;
+  windowFrom: string;
+  windowTo: string;
+  windowsSkipped: number;
+  /** Date string the next invocation should resume from. */
+  nextFrom: string;
+}
+
+// How many consecutive empty windows we skip within a single invocation before
+// returning — lets the first run blow past the data-less early years (the
+// eTenders OCDS feed has nothing before ~2017) without burning page budget.
+const MAX_EMPTY_SKIPS = 48;
+
 /**
- * Windowed backfill: process a single [cursor, cursor + windowMonths] window per
- * invocation, then advance the cursor. Stops advancing once within 30 days of now.
+ * Robust windowed backfill. Within one invocation it will:
+ *   - resume mid-window via the cursor's last_page_number when a window was
+ *     truncated by the page cap (guarantees completeness for dense windows);
+ *   - cheaply skip empty windows (one page-1 probe each) up to MAX_EMPTY_SKIPS;
+ *   - process the first data-bearing window up to maxPages, then return.
+ * Progress is persisted to the cursor on every step so runs are resumable.
  */
-async function runBackfill(
+export async function runBackfill(
   supabase: SupabaseClient,
-  cursorMode: string,
-  windowMonths: number,
-  maxPages: number,
-): Promise<RunStats & { done: boolean; windowFrom: string; windowTo: string }> {
-  const cursor = await readCursor(supabase, cursorMode);
-  const windowStart = cursor?.last_synced_date
-    ? new Date(cursor.last_synced_date)
-    : new Date(BACKFILL_EPOCH);
-
+  opts: BackfillOptions,
+): Promise<BackfillResult> {
+  const { cursorMode, windowMonths, maxPages } = opts;
   const now = new Date();
-  const caughtUpAt = new Date(now.getTime() - CAUGHT_UP_MS);
+  const hardEnd = opts.rangeEnd ?? new Date(now.getTime() - CAUGHT_UP_MS);
+  const floor = opts.rangeStart ?? new Date(BACKFILL_EPOCH);
+
+  const cursor = await readCursor(supabase, cursorMode);
+  let windowStart = cursor?.last_synced_date
+    ? new Date(cursor.last_synced_date)
+    : floor;
+  if (windowStart < floor) windowStart = floor;
+  let startPage = (cursor?.last_page_number ?? 0) + 1;
+
   const stats: RunStats = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0 };
-
-  // Already caught up — incremental owns the recent window from here.
-  if (windowStart >= caughtUpAt) {
-    await writeCursor(supabase, cursorMode, { status: "completed" });
-    return {
-      ...stats,
-      done: true,
-      windowFrom: toOCDSDate(windowStart),
-      windowTo: toOCDSDate(windowStart),
-    };
-  }
-
-  let windowEnd = addMonths(windowStart, windowMonths);
-  if (windowEnd > now) windowEnd = now;
+  let skips = 0;
+  let windowFrom = toOCDSDate(windowStart);
+  let windowTo = windowFrom;
 
   await writeCursor(supabase, cursorMode, { status: "running" });
 
-  const dateFrom = toOCDSDate(windowStart);
-  const dateTo = toOCDSDate(windowEnd);
+  const persist = async (
+    resumeDate: Date,
+    page: number,
+    status: string,
+  ): Promise<void> => {
+    await writeCursor(supabase, cursorMode, {
+      last_synced_date: resumeDate.toISOString(),
+      last_page_number: page,
+      total_records: (cursor?.total_records ?? 0) + stats.fetched,
+      status,
+    });
+  };
 
-  for (let page = 1; page <= maxPages; page++) {
-    const pkg = await fetchOCDSPage(page, dateFrom, dateTo);
-    const releases = pkg.releases;
-    if (releases.length === 0) break;
-    stats.pages += 1;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (windowStart >= hardEnd) {
+      await persist(hardEnd, 0, "completed");
+      return {
+        ...stats,
+        done: true,
+        windowFrom,
+        windowTo,
+        windowsSkipped: skips,
+        nextFrom: toOCDSDate(hardEnd),
+      };
+    }
 
-    const r = await upsertReleases(supabase, releases);
-    stats.fetched += releases.length;
-    stats.newCount += r.newCount;
-    stats.updatedCount += r.updatedCount;
+    let windowEnd = addMonths(windowStart, windowMonths);
+    if (windowEnd > hardEnd) windowEnd = hardEnd;
+    windowFrom = toOCDSDate(windowStart);
+    windowTo = toOCDSDate(windowEnd);
 
-    if (!pkg.links?.next) break;
-    if (releases.length < PAGE_SIZE) break;
+    let windowFetched = 0;
+    let lastPage = startPage - 1;
+    let drained = false;
+
+    for (let n = 0; n < maxPages; n++) {
+      const page = startPage + n;
+      const pkg = await fetchOCDSPage(page, windowFrom, windowTo);
+      const releases = pkg.releases;
+      if (releases.length === 0) {
+        drained = true;
+        break;
+      }
+      const r = await upsertReleases(supabase, releases);
+      stats.fetched += releases.length;
+      stats.newCount += r.newCount;
+      stats.updatedCount += r.updatedCount;
+      stats.pages += 1;
+      windowFetched += releases.length;
+      lastPage = page;
+
+      if (!pkg.links?.next || releases.length < PAGE_SIZE) {
+        drained = true;
+        break;
+      }
+    }
+
+    if (!drained) {
+      // Hit the page cap mid-window — resume this same window next invocation.
+      await persist(windowStart, lastPage, "idle");
+      return {
+        ...stats,
+        done: false,
+        windowFrom,
+        windowTo,
+        windowsSkipped: skips,
+        nextFrom: windowFrom,
+      };
+    }
+
+    // Window fully drained — advance to the next window.
+    windowStart = windowEnd;
+    startPage = 1;
+
+    if (windowFetched === 0) {
+      // Empty window: skip cheaply, but bound the scan so we stay under 300s.
+      skips += 1;
+      if (skips < MAX_EMPTY_SKIPS && windowStart < hardEnd) {
+        await persist(windowStart, 0, "running");
+        continue;
+      }
+      const done = windowStart >= hardEnd;
+      await persist(windowStart, 0, done ? "completed" : "idle");
+      return {
+        ...stats,
+        done,
+        windowFrom,
+        windowTo,
+        windowsSkipped: skips,
+        nextFrom: toOCDSDate(windowStart),
+      };
+    }
+
+    // Got data and drained the window — stop; the next run takes the next window.
+    const done = windowStart >= hardEnd;
+    await persist(windowStart, 0, done ? "completed" : "idle");
+    return {
+      ...stats,
+      done,
+      windowFrom,
+      windowTo,
+      windowsSkipped: skips,
+      nextFrom: toOCDSDate(windowStart),
+    };
   }
-
-  const done = windowEnd >= caughtUpAt;
-  await writeCursor(supabase, cursorMode, {
-    last_synced_date: windowEnd.toISOString(),
-    last_page_number: stats.pages,
-    total_records: (cursor?.total_records ?? 0) + stats.fetched,
-    status: done ? "completed" : "idle",
-  });
-
-  return { ...stats, done, windowFrom: dateFrom, windowTo: dateTo };
 }
 
 // ── Documents mode ────────────────────────────────────────────────────────────
@@ -399,16 +507,28 @@ async function runDocuments(supabase: SupabaseClient): Promise<{ queued: number 
     (r) => !existing.has(`${r.tender_id} ${r.source_url}`),
   );
 
-  for (const part of chunk(rows, 500)) {
+  if (newRows.length === 0) return { queued: 0 };
+
+  // Plain insert of the already-deduped new rows. We intentionally do NOT use
+  // ON CONFLICT here: the only guaranteed unique index is (tender_id,
+  // file_name, source_url), and newRows are pre-filtered to be absent by
+  // (tender_id, source_url) — a superset — so they cannot collide.
+  let inserted = 0;
+  for (const part of chunk(newRows, 500)) {
     const { error: insertError } = await supabase
       .from("tender_documents")
-      .upsert(part, { onConflict: "tender_id,source_url", ignoreDuplicates: true });
+      .insert(part);
     if (insertError) {
-      throw new Error(`tender_documents insert failed: ${insertError.message}`);
+      // A duplicate from a concurrent run is non-fatal; anything else surfaces.
+      if (!/duplicate key|unique constraint/i.test(insertError.message)) {
+        throw new Error(`tender_documents insert failed: ${insertError.message}`);
+      }
+      continue;
     }
+    inserted += part.length;
   }
 
-  return { queued: newRows.length };
+  return { queued: inserted };
 }
 
 // ── Route handler ───────────────────────────────────────────────────────────
@@ -429,10 +549,11 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const modeParam = req.nextUrl.searchParams.get("mode") ?? "incremental";
+  const rawMode = req.nextUrl.searchParams.get("mode") ?? "incremental";
+  const modeParam = LEGACY_ALIASES[rawMode] ?? rawMode;
   if (!VALID_MODES.includes(modeParam as SyncMode)) {
     return NextResponse.json(
-      { error: `Invalid mode "${modeParam}". Valid modes: ${VALID_MODES.join(", ")}` },
+      { error: `Invalid mode "${rawMode}". Valid modes: ${VALID_MODES.join(", ")}` },
       { status: 400 },
     );
   }
@@ -440,6 +561,28 @@ export async function GET(req: NextRequest) {
 
   const supabase = createServiceClient();
   const startTime = new Date();
+
+  // Lightweight diagnostics: row counts + cursor state. Use this to confirm the
+  // schema is in place and watch sync progress (e.g. ?mode=status).
+  if (mode === "status") {
+    const [{ count: tenders }, { count: documents }, { data: cursors }] =
+      await Promise.all([
+        supabase.from("tenders").select("*", { count: "exact", head: true }),
+        supabase.from("tender_documents").select("*", { count: "exact", head: true }),
+        supabase
+          .from("ocds_sync_cursor")
+          .select("sync_mode, last_synced_date, last_page_number, total_records, status")
+          .order("sync_mode"),
+      ]);
+    return NextResponse.json({
+      success: true,
+      mode: "status",
+      tenders: tenders ?? 0,
+      documents: documents ?? 0,
+      cursors: cursors ?? [],
+      now: new Date().toISOString(),
+    });
+  }
 
   let stats: RunStats = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0 };
   let queued = 0;
@@ -455,17 +598,44 @@ export async function GET(req: NextRequest) {
         stats = await runIncremental(supabase, "awarded", INCREMENTAL_MAX_PAGES, true);
         break;
       case "backfill": {
-        const r = await runBackfill(supabase, "backfill", BACKFILL_WINDOW_MONTHS, BACKFILL_MAX_PAGES);
+        const r = await runBackfill(supabase, {
+          cursorMode: "backfill",
+          windowMonths: BACKFILL_WINDOW_MONTHS,
+          maxPages: BACKFILL_MAX_PAGES,
+        });
         stats = r;
-        extra = { done: r.done, windowFrom: r.windowFrom, windowTo: r.windowTo };
+        extra = {
+          done: r.done,
+          windowFrom: r.windowFrom,
+          windowTo: r.windowTo,
+          windowsSkipped: r.windowsSkipped,
+          nextFrom: r.nextFrom,
+        };
         break;
       }
       case "ocds-full": {
-        // Reset the backfill cursor to the epoch and restart with wider windows.
-        await writeCursor(supabase, "backfill", { last_synced_date: BACKFILL_EPOCH, status: "idle" });
-        const r = await runBackfill(supabase, "backfill", OCDS_FULL_WINDOW_MONTHS, BACKFILL_MAX_PAGES);
+        // Continues the same `backfill` cursor (so it progresses run-to-run).
+        // Pass ?reset=true to restart history from the epoch.
+        if (req.nextUrl.searchParams.get("reset") === "true") {
+          await writeCursor(supabase, "backfill", {
+            last_synced_date: BACKFILL_EPOCH,
+            last_page_number: 0,
+            status: "idle",
+          });
+        }
+        const r = await runBackfill(supabase, {
+          cursorMode: "backfill",
+          windowMonths: OCDS_FULL_WINDOW_MONTHS,
+          maxPages: BACKFILL_MAX_PAGES,
+        });
         stats = r;
-        extra = { done: r.done, windowFrom: r.windowFrom, windowTo: r.windowTo };
+        extra = {
+          done: r.done,
+          windowFrom: r.windowFrom,
+          windowTo: r.windowTo,
+          windowsSkipped: r.windowsSkipped,
+          nextFrom: r.nextFrom,
+        };
         break;
       }
       case "documents": {

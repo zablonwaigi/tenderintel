@@ -27,6 +27,14 @@ alter table public.tenders
 -- ── UNIQUE constraint on ocid (required for upsert onConflict: 'ocid') ──────
 -- A unique index permits multiple NULLs, so portal-only rows without an ocid
 -- are unaffected while OCDS rows are de-duplicated by ocid.
+-- First collapse any pre-existing duplicate non-null ocids (keep most recent)
+-- so the unique index can be built without error.
+delete from public.tenders t
+  using public.tenders dup
+  where t.ocid is not null
+    and t.ocid = dup.ocid
+    and (t.updated_at, t.id) < (dup.updated_at, dup.id);
+
 create unique index if not exists tenders_ocid_unique_idx on public.tenders(ocid);
 
 create index if not exists tenders_ocds_tags_idx on public.tenders using gin(ocds_tags);
