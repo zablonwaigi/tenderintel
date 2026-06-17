@@ -25,6 +25,13 @@ export function createServiceClient(): SupabaseClient {
       persistSession: false,
       autoRefreshToken: false,
     },
+    global: {
+      // Next.js patches the global fetch and caches GET requests (including
+      // PostgREST SELECTs) by default. That makes the service client read
+      // stale data — e.g. the document-download batch replaying an already
+      // drained "pending" list. Force every request to bypass that cache.
+      fetch: (input, init) => fetch(input, { ...init, cache: "no-store" }),
+    },
   });
 
   return cached;

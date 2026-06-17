@@ -13,6 +13,7 @@ import {
 } from "./ocds-client";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 export const maxDuration = 300;
 
 /** Per-run safety caps so a single invocation stays under the 300s task timeout. */

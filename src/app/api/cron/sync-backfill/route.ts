@@ -4,6 +4,7 @@ import { createServiceClient } from "@/lib/supabase/server";
 import { runBackfill, writeCursor } from "../sync-tenders/route";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 export const maxDuration = 300;
 
 /**
