@@ -11,6 +11,7 @@ import {
   type Release,
   type Document,
 } from "./ocds-client";
+import { fetchPortalPage, mapPortalRecord } from "./portal-client";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -28,6 +29,10 @@ const CAUGHT_UP_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — incremental takes 
 // drain the backlog and keep up with newly-queued documents.
 const DOWNLOAD_BATCH = 200;
 
+// Portal full-catalogue ingest (status 1=active,2=awarded,3=closed,4=cancelled).
+const PORTAL_PAGE_SIZE = 500;
+const PORTAL_MAX_PAGES_PER_RUN = 20; // ~10k records/run, resumable across runs
+
 const VALID_MODES = [
   "incremental",
   "backfill",
@@ -35,6 +40,7 @@ const VALID_MODES = [
   "documents",
   "download",
   "ocds-full",
+  "portal",
   "status",
 ] as const;
 type SyncMode = (typeof VALID_MODES)[number];
@@ -120,6 +126,7 @@ export interface SyncCursor {
   sync_mode: string;
   last_synced_date: string | null;
   last_page_number: number | null;
+  total_pages: number | null;
   total_records: number | null;
   status: string | null;
 }
@@ -130,7 +137,7 @@ export async function readCursor(
 ): Promise<SyncCursor | null> {
   const { data } = await supabase
     .from("ocds_sync_cursor")
-    .select("sync_mode, last_synced_date, last_page_number, total_records, status")
+    .select("sync_mode, last_synced_date, last_page_number, total_pages, total_records, status")
     .eq("sync_mode", mode)
     .maybeSingle();
   return (data as SyncCursor) ?? null;
@@ -142,6 +149,7 @@ export async function writeCursor(
   fields: Partial<{
     last_synced_date: string;
     last_page_number: number;
+    total_pages: number;
     total_records: number;
     status: string;
   }>,
@@ -570,6 +578,96 @@ async function runDocuments(
   return { queued: inserted, scanned };
 }
 
+// ── Portal full-catalogue ingest ────────────────────────────────────────────
+
+/** Upsert portal-mapped rows keyed on tender_id (merges with OCDS rows by ocid). */
+async function upsertPortalRows(
+  supabase: SupabaseClient,
+  rows: ReturnType<typeof mapPortalRecord>[],
+): Promise<{ newCount: number; updatedCount: number }> {
+  const byId = new Map<string, ReturnType<typeof mapPortalRecord>>();
+  for (const r of rows) if (r.tender_id) byId.set(r.tender_id, r);
+  const unique = [...byId.values()];
+  if (unique.length === 0) return { newCount: 0, updatedCount: 0 };
+
+  const existing = new Set<string>();
+  for (const part of chunk([...byId.keys()], 1000)) {
+    const { data } = await supabase.from("tenders").select("tender_id").in("tender_id", part);
+    for (const r of data ?? []) if (r.tender_id) existing.add(r.tender_id as string);
+  }
+  const newCount = unique.filter((r) => !existing.has(r.tender_id)).length;
+
+  for (const part of chunk(unique, 500)) {
+    const { error } = await supabase
+      .from("tenders")
+      .upsert(part, { onConflict: "tender_id", ignoreDuplicates: false });
+    if (error) throw new Error(`portal upsert failed: ${error.message}`);
+  }
+  return { newCount, updatedCount: unique.length - newCount };
+}
+
+/**
+ * Resumable portal ingest. Walks statuses 1→4 paging by `start`, processing a
+ * bounded number of pages per invocation and persisting (statusId, start) in the
+ * `portal` cursor so subsequent runs continue where this one stopped. Once the
+ * full sweep completes it switches to refreshing status=1 (active) only, since
+ * the historical awarded/closed/cancelled sets are effectively static.
+ * Use ?reset=true to restart the full sweep.
+ */
+async function runPortal(
+  supabase: SupabaseClient,
+): Promise<RunStats & { statusId: number; start: number; done: boolean; refresh: boolean }> {
+  const cursor = await readCursor(supabase, "portal");
+  const refresh = cursor?.status === "completed";
+  let statusId = refresh ? 1 : cursor?.total_pages && cursor.total_pages >= 1 && cursor.total_pages <= 4 ? cursor.total_pages : 1;
+  let start = refresh ? 0 : cursor?.last_page_number ?? 0;
+
+  await writeCursor(supabase, "portal", { status: "running" });
+
+  const stats: RunStats = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0 };
+  let done = false;
+
+  for (let p = 0; p < PORTAL_MAX_PAGES_PER_RUN; p++) {
+    const page = await fetchPortalPage(statusId, start, PORTAL_PAGE_SIZE);
+    const records = page.data;
+
+    if (records.length > 0) {
+      const rows = records.map((r) => mapPortalRecord(r, statusId));
+      const u = await upsertPortalRows(supabase, rows);
+      stats.fetched += records.length;
+      stats.newCount += u.newCount;
+      stats.updatedCount += u.updatedCount;
+      stats.pages += 1;
+    }
+
+    const lastOfStatus = records.length < PORTAL_PAGE_SIZE;
+    if (lastOfStatus) {
+      // Refresh mode only sweeps status 1; full mode advances to the next status.
+      if (refresh) {
+        done = true;
+        break;
+      }
+      statusId += 1;
+      start = 0;
+      if (statusId > 4) {
+        done = true;
+        break;
+      }
+    } else {
+      start += PORTAL_PAGE_SIZE;
+    }
+  }
+
+  await writeCursor(supabase, "portal", {
+    last_page_number: done ? 0 : start,
+    total_pages: done ? 1 : statusId,
+    total_records: (cursor?.total_records ?? 0) + stats.fetched,
+    status: done ? "completed" : "idle",
+  });
+
+  return { ...stats, statusId, start, done, refresh };
+}
+
 // ── Route handler ───────────────────────────────────────────────────────────
 
 /**
@@ -709,6 +807,24 @@ export async function GET(req: NextRequest) {
           total_records: r.scanned,
           status: "completed",
         });
+        break;
+      }
+      case "portal": {
+        if (req.nextUrl.searchParams.get("reset") === "true") {
+          await writeCursor(supabase, "portal", {
+            last_page_number: 0,
+            total_pages: 1,
+            status: "idle",
+          });
+        }
+        const r = await runPortal(supabase);
+        stats = r;
+        extra = {
+          done: r.done,
+          statusId: r.statusId,
+          start: r.start,
+          refresh: r.refresh,
+        };
         break;
       }
       case "download": {

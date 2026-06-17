@@ -62,6 +62,7 @@ environment variable. Each task command therefore sends:
 | `sync-awarded` | Mon 07:00 | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=awarded" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-documents` | Every 4 hours | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=documents" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-downloads` | Hourly | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=download" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
+| `sync-portal` | Hourly (until full, then daily) | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=portal" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-ocds-full` | 1st of month 02:00 | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-tenders?mode=backfill" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 | `sync-backfill-init` | Manual / run-once | `curl -X GET "https://growyourbizsa.co.za/api/cron/sync-backfill?from=2015-01-01&to=2026-06-01" -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"` |
 
@@ -89,8 +90,16 @@ runs.
   **continues** the `backfill` cursor run-to-run (it no longer resets every run,
   which previously pinned it to the empty 2015 window forever). Pass
   `?reset=true` to deliberately restart history from `2015-01-01`.
-- **`status`** — read-only diagnostics: returns `tenders`/`documents` counts and
-  every sync cursor. Writes nothing.
+- **`portal`** — ingests the **full eTenders portal catalogue** (the OCDS feed
+  only carries ~3k currently-active tenders; the portal has ~156k across all
+  statuses: advertised/awarded/closed/cancelled). Resumable: each run processes
+  up to ~10k records and persists `(statusId, start)` in the `portal` cursor, so
+  call it repeatedly until the response shows `"done":true`. Rows merge with
+  OCDS rows by `ocid` when present (else keyed `portal-<id>`). Once the full
+  sweep completes the cursor flips to `completed` and subsequent runs only
+  refresh status=1 (active). Pass `?reset=true` to restart the full sweep.
+- **`status`** — read-only diagnostics: returns `tenders`/`documents` counts,
+  a `by_status` breakdown, and every sync cursor. Writes nothing.
 - **`documents`** — walks the **entire** tenders table (paged) and queues OCDS
   document URLs from `tender.documents[]`, `awards[*].documents[]` and
   `contracts[*].documents[]` into `tender_documents` as `download_status='pending'`.

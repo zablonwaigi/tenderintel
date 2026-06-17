@@ -67,7 +67,8 @@ values
   ('backfill',    '2015-01-01T00:00:00Z'),
   ('awarded',     '2020-01-01T00:00:00Z'),
   ('documents',   null),
-  ('download',    null)
+  ('download',    null),
+  ('portal',      null)
 on conflict (sync_mode) do nothing;
 
 -- ── RLS: service role full access ───────────────────────────────────────────
