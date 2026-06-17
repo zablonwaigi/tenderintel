@@ -43,11 +43,41 @@ export class DocumentDownloader {
   }
 
   async ensureBucket(): Promise<void> {
-    const { data, error } = await this.supabase.storage.getBucket(STORAGE_BUCKET);
-    if (error || !data) {
+    const { data } = await this.supabase.storage.getBucket(STORAGE_BUCKET);
+    if (!data) {
       // Private bucket — downloads served via signed URLs.
-      await this.supabase.storage.createBucket(STORAGE_BUCKET, { public: false });
+      await this.supabase.storage.createBucket(STORAGE_BUCKET, {
+        public: false,
+        allowedMimeTypes: null,
+        fileSizeLimit: null,
+      });
+      return;
     }
+    // Clear any MIME-type allowlist on an existing bucket so .doc/.xls/.zip
+    // (e.g. application/msword) are not rejected at upload time.
+    if (data.allowed_mime_types) {
+      await this.supabase.storage
+        .updateBucket(STORAGE_BUCKET, {
+          public: false,
+          allowedMimeTypes: null,
+          fileSizeLimit: null,
+        })
+        .catch(() => {});
+    }
+  }
+
+  private async upload(path: string, bytes: Uint8Array, contentType: string) {
+    const bucket = this.supabase.storage.from(STORAGE_BUCKET);
+    let { error } = await bucket.upload(path, bytes, { contentType, upsert: true });
+    if (error && contentType !== "application/octet-stream") {
+      // Some buckets reject specific MIME types (e.g. application/msword) —
+      // retry as generic binary, which is broadly allowed.
+      ({ error } = await bucket.upload(path, bytes, {
+        contentType: "application/octet-stream",
+        upsert: true,
+      }));
+    }
+    return error;
   }
 
   private async downloadOne(doc: DocRow): Promise<boolean> {
@@ -71,12 +101,12 @@ export class DocumentDownloader {
         const path = buildPath(doc);
         const contentType = res.headers.get("content-type") ?? "application/octet-stream";
 
-        const { error: uploadError } = await this.supabase.storage
-          .from(STORAGE_BUCKET)
-          .upload(path, bytes, { contentType, upsert: true });
+        const uploadError = await this.upload(path, bytes, contentType);
         if (uploadError) throw uploadError;
 
-        await this.supabase
+        // CRITICAL: surface update failures. If this silently fails the row
+        // stays 'pending' and every batch re-selects (and re-uploads) it.
+        const { error: updateError } = await this.supabase
           .from("tender_documents")
           .update({
             download_status: "downloaded",
@@ -85,6 +115,7 @@ export class DocumentDownloader {
             downloaded_at: new Date().toISOString(),
           })
           .eq("id", doc.id);
+        if (updateError) throw new Error(`status update failed: ${updateError.message}`);
 
         return true;
       } catch (err) {
@@ -93,10 +124,13 @@ export class DocumentDownloader {
       }
     }
 
-    await this.supabase
+    const { error: failError } = await this.supabase
       .from("tender_documents")
       .update({ download_status: "failed" })
       .eq("id", doc.id);
+    if (failError) {
+      console.error(`Could not mark ${doc.id} as failed:`, failError.message);
+    }
 
     console.error(`Download failed for ${doc.file_name} (${doc.id}):`, lastError);
     return false;
@@ -113,6 +147,7 @@ export class DocumentDownloader {
       .select("id, tender_id, file_name, source_url, tenders(status, date_advertised)")
       .eq("download_status", "pending")
       .not("source_url", "is", null)
+      .order("created_at", { ascending: true })
       .limit(limit);
 
     if (error) throw new Error(`Failed to query pending documents: ${error.message}`);
