@@ -88,11 +88,21 @@ function buildPortalQuery(status: number, start: number, length: number): string
   return p.toString();
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const PORTAL_FETCH_RETRIES = 3;
+
 /**
  * Fetch one page of portal tenders for a status.
  * @param status 1=advertised 2=awarded 3=closed 4=cancelled
  * @param start  row offset
  * @param length page size (<=500 recommended)
+ *
+ * The upstream portal occasionally 500s on deep pagination offsets (observed
+ * around start=28000 for status=2). Retry with backoff so a single transient
+ * error doesn't permanently halt a resumable multi-page sweep.
  */
 export async function fetchPortalPage(
   status: number,
@@ -100,25 +110,52 @@ export async function fetchPortalPage(
   length = 500,
 ): Promise<PortalPage> {
   const url = `${PORTAL_BASE}${PORTAL_ENDPOINT}?${buildPortalQuery(status, start, length)}`;
-  const res = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "X-Requested-With": "XMLHttpRequest",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      Referer: `${PORTAL_BASE}/Home/opportunities?id=1`,
-    },
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) throw new Error(`Portal API ${res.status}`);
 
-  const text = await res.text();
-  const json = JSON.parse(text) as Partial<PortalPage>;
-  return {
-    recordsTotal: json.recordsTotal ?? 0,
-    recordsFiltered: json.recordsFiltered ?? 0,
-    data: Array.isArray(json.data) ? json.data : [],
-  };
+  let lastError: unknown;
+  for (let attempt = 0; attempt < PORTAL_FETCH_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          "X-Requested-With": "XMLHttpRequest",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          Referer: `${PORTAL_BASE}/Home/opportunities?id=1`,
+        },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) throw new Error(`Portal API ${res.status}`);
+
+      const text = await res.text();
+      const json = JSON.parse(text) as Partial<PortalPage>;
+      return {
+        recordsTotal: json.recordsTotal ?? 0,
+        recordsFiltered: json.recordsFiltered ?? 0,
+        data: Array.isArray(json.data) ? json.data : [],
+      };
+    } catch (err) {
+      lastError = err;
+      if (attempt < PORTAL_FETCH_RETRIES - 1) await sleep(2000 * (attempt + 1));
+    }
+  }
+  throw new Error(
+    `Portal fetch failed after ${PORTAL_FETCH_RETRIES} attempts (status=${status} start=${start}): ${lastError}`,
+  );
+}
+
+/**
+ * Build the document download URL for a portal `supportDocument[]` entry.
+ * Confirmed pattern: blobName = supportDocumentID + extension, and
+ * downloadedFileName = the original fileName.
+ */
+export function portalDocumentUrl(doc: PortalSupportDocument): string | null {
+  if (!doc.supportDocumentID) return null;
+  const blobName = `${doc.supportDocumentID}${doc.extension ?? ""}`;
+  const qs = new URLSearchParams({
+    blobName,
+    downloadedFileName: doc.fileName || blobName,
+  });
+  return `${PORTAL_BASE}/home/Download/?${qs.toString()}`;
 }
 
 /** Parse portal dates: ISO strings or .NET `/Date(ms)/`. Returns null if invalid. */

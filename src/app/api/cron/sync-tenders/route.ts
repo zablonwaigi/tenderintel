@@ -11,7 +11,13 @@ import {
   type Release,
   type Document,
 } from "./ocds-client";
-import { fetchPortalPage, mapPortalRecord } from "./portal-client";
+import {
+  fetchPortalPage,
+  mapPortalRecord,
+  portalDocumentUrl,
+  type PortalRecord,
+  type PortalSupportDocument,
+} from "./portal-client";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -483,9 +489,13 @@ interface DocCandidate {
 }
 
 /**
- * Scan recently-synced tenders for OCDS document URLs and queue any new ones
- * into `tender_documents` (ON CONFLICT (tender_id, source_url) DO NOTHING).
- * Returns the number of newly-queued documents.
+ * Scan the entire tenders table for OCDS document URLs (ocds_data) and portal
+ * supportDocument[] entries (raw_portal_data), queuing any new ones into
+ * tender_documents. Returns the number of newly-queued documents.
+ *
+ * NOTE: the eTenders portal only populates supportDocument[] for
+ * status=active and status=cancelled records in practice - awarded/closed
+ * portal rows have been observed with no documents attached at the source.
  */
 async function runDocuments(
   supabase: SupabaseClient,
@@ -500,8 +510,8 @@ async function runDocuments(
   for (let offset = 0; ; offset += BATCH) {
     const { data, error } = await supabase
       .from("tenders")
-      .select("tender_id, ocds_data")
-      .not("ocds_data", "is", null)
+      .select("tender_id, ocds_data, raw_portal_data")
+      .or("ocds_data.not.is.null,raw_portal_data.not.is.null")
       .order("tender_id", { ascending: true })
       .range(offset, offset + BATCH - 1);
     if (error) throw new Error(`tenders query failed: ${error.message}`);
@@ -509,24 +519,48 @@ async function runDocuments(
     const batch = data ?? [];
     for (const row of batch) {
       const tenderId = row.tender_id as string;
-      const ocds = (row.ocds_data ?? {}) as Release;
-      const docs: Document[] = [
-        ...(ocds.tender?.documents ?? []),
-        ...(ocds.awards ?? []).flatMap((a) => a.documents ?? []),
-        ...(ocds.contracts ?? []).flatMap((c) => c.documents ?? []),
-      ];
 
-      for (const doc of docs) {
-      if (!doc?.url) continue;
-      const key = `${tenderId} ${doc.url}`;
-      if (candidates.has(key)) continue;
-      candidates.set(key, {
-        tender_id: tenderId,
-        file_name: fileNameFromDoc(doc, doc.url),
-        source_url: doc.url,
-        file_type: fileTypeFromUrl(doc.url, doc.format),
-        download_status: "pending",
-      });
+      if (row.ocds_data) {
+        const ocds = row.ocds_data as Release;
+        const docs: Document[] = [
+          ...(ocds.tender?.documents ?? []),
+          ...(ocds.awards ?? []).flatMap((a) => a.documents ?? []),
+          ...(ocds.contracts ?? []).flatMap((c) => c.documents ?? []),
+        ];
+        for (const doc of docs) {
+          if (!doc?.url) continue;
+          const key = `${tenderId} ${doc.url}`;
+          if (candidates.has(key)) continue;
+          candidates.set(key, {
+            tender_id: tenderId,
+            file_name: fileNameFromDoc(doc, doc.url),
+            source_url: doc.url,
+            file_type: fileTypeFromUrl(doc.url, doc.format),
+            download_status: "pending",
+          });
+        }
+      }
+
+      if (row.raw_portal_data) {
+        const raw = row.raw_portal_data as PortalRecord;
+        const supportDocs: PortalSupportDocument[] = Array.isArray(raw.supportDocument)
+          ? raw.supportDocument
+          : [];
+        for (const doc of supportDocs) {
+          if (doc.active === false) continue;
+          const url = portalDocumentUrl(doc);
+          if (!url) continue;
+          const key = `${tenderId} ${url}`;
+          if (candidates.has(key)) continue;
+          const fileName = doc.fileName || `${doc.supportDocumentID}${doc.extension ?? ""}`;
+          candidates.set(key, {
+            tender_id: tenderId,
+            file_name: fileName,
+            source_url: url,
+            file_type: doc.extension ? doc.extension.replace(/^\./, "").toLowerCase() : null,
+            download_status: "pending",
+          });
+        }
       }
     }
 
@@ -547,12 +581,12 @@ async function runDocuments(
       .select("tender_id, source_url")
       .in("source_url", part);
     for (const r of existingRows ?? []) {
-      existing.add(`${r.tender_id} ${r.source_url}`);
+      existing.add(`${r.tender_id} ${r.source_url}`);
     }
   }
 
   const newRows = rows.filter(
-    (r) => !existing.has(`${r.tender_id} ${r.source_url}`),
+    (r) => !existing.has(`${r.tender_id} ${r.source_url}`),
   );
 
   if (newRows.length === 0) return { queued: 0, scanned };
@@ -827,19 +861,66 @@ export async function GET(req: NextRequest) {
           return NextResponse.json({ success: true, mode: "portal", skipped: "already running" });
         }
 
-        const r = await runPortal(supabase);
-        stats = r;
-        extra = { done: r.done, statusId: r.statusId, start: r.start, refresh: r.refresh };
+        // Drive the sweep with an in-process loop rather than relying solely on
+        // a single fire-and-forget self-chained fetch: that hop has proven
+        // unreliable (the chain repeatedly stalled at "idle" without the next
+        // hop completing) and gave up entirely the moment a single upstream
+        // request failed. Looping in-process means one trigger makes as much
+        // progress as fits in the task timeout, and a transient page failure
+        // (now retried inside fetchPortalPage) only ends this invocation's
+        // loop instead of marking the whole sweep failed.
+        const deadline = Date.now() + 250_000; // stay under the 300s task cap
+        const agg: RunStats & {
+          statusId: number;
+          start: number;
+          done: boolean;
+          refresh: boolean;
+        } = { fetched: 0, newCount: 0, updatedCount: 0, pages: 0, statusId: 0, start: 0, done: false, refresh: false };
+        let loopError: Error | null = null;
 
-        // Self-chain: while the full sweep isn't done, fire the next chunk without
-        // awaiting so a single trigger drives the whole ~156k load to completion.
-        // (Coolify runs a persistent node server, so the pending fetch survives.)
-        if (!r.done && !r.refresh) {
+        while (Date.now() < deadline) {
+          let r: Awaited<ReturnType<typeof runPortal>>;
+          try {
+            r = await runPortal(supabase);
+          } catch (err) {
+            loopError = err instanceof Error ? err : new Error(String(err));
+            break;
+          }
+          agg.fetched += r.fetched;
+          agg.newCount += r.newCount;
+          agg.updatedCount += r.updatedCount;
+          agg.pages += r.pages;
+          agg.statusId = r.statusId;
+          agg.start = r.start;
+          agg.done = r.done;
+          agg.refresh = r.refresh;
+          if (r.done) break;
+        }
+
+        stats = agg;
+        extra = {
+          done: agg.done,
+          statusId: agg.statusId,
+          start: agg.start,
+          refresh: agg.refresh,
+          ...(loopError ? { loopError: loopError.message } : {}),
+        };
+
+        // Safety-net self-chain in case the time budget ran out before the
+        // sweep finished (the hourly sync-portal cron task also resumes it).
+        if (!agg.done && !agg.refresh) {
           const next = new URL(req.nextUrl.pathname, req.nextUrl.origin);
           next.searchParams.set("mode", "portal");
           void fetch(next.toString(), {
             headers: { Authorization: `Bearer ${process.env.CRON_SECRET ?? ""}` },
           }).catch(() => {});
+        }
+
+        // Only surface as a hard failure if this invocation made zero progress
+        // at all — otherwise the partial progress is real and worth keeping,
+        // and the next run (self-chain or hourly cron) will simply resume.
+        if (loopError && agg.fetched === 0 && agg.pages === 0) {
+          throw loopError;
         }
         break;
       }
