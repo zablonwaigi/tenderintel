@@ -129,6 +129,7 @@ export interface SyncCursor {
   total_pages: number | null;
   total_records: number | null;
   status: string | null;
+  updated_at: string | null;
 }
 
 export async function readCursor(
@@ -137,7 +138,7 @@ export async function readCursor(
 ): Promise<SyncCursor | null> {
   const { data } = await supabase
     .from("ocds_sync_cursor")
-    .select("sync_mode, last_synced_date, last_page_number, total_pages, total_records, status")
+    .select("sync_mode, last_synced_date, last_page_number, total_pages, total_records, status, updated_at")
     .eq("sync_mode", mode)
     .maybeSingle();
   return (data as SyncCursor) ?? null;
@@ -817,14 +818,29 @@ export async function GET(req: NextRequest) {
             status: "idle",
           });
         }
+        // Overlap lock: if another self-chained run is active (status=running
+        // and touched in the last 15 min), skip so we don't double up.
+        const pc = await readCursor(supabase, "portal");
+        const stale =
+          !pc?.updated_at || Date.now() - new Date(pc.updated_at).getTime() > 15 * 60 * 1000;
+        if (pc?.status === "running" && !stale) {
+          return NextResponse.json({ success: true, mode: "portal", skipped: "already running" });
+        }
+
         const r = await runPortal(supabase);
         stats = r;
-        extra = {
-          done: r.done,
-          statusId: r.statusId,
-          start: r.start,
-          refresh: r.refresh,
-        };
+        extra = { done: r.done, statusId: r.statusId, start: r.start, refresh: r.refresh };
+
+        // Self-chain: while the full sweep isn't done, fire the next chunk without
+        // awaiting so a single trigger drives the whole ~156k load to completion.
+        // (Coolify runs a persistent node server, so the pending fetch survives.)
+        if (!r.done && !r.refresh) {
+          const next = new URL(req.nextUrl.pathname, req.nextUrl.origin);
+          next.searchParams.set("mode", "portal");
+          void fetch(next.toString(), {
+            headers: { Authorization: `Bearer ${process.env.CRON_SECRET ?? ""}` },
+          }).catch(() => {});
+        }
         break;
       }
       case "download": {
