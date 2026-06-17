@@ -92,19 +92,35 @@ runs.
   `?reset=true` to deliberately restart history from `2015-01-01`.
 - **`portal`** — ingests the **full eTenders portal catalogue** (the OCDS feed
   only carries ~3k currently-active tenders; the portal has ~156k across all
-  statuses: advertised/awarded/closed/cancelled). Resumable: each run processes
-  up to ~10k records and persists `(statusId, start)` in the `portal` cursor, so
-  call it repeatedly until the response shows `"done":true`. Rows merge with
-  OCDS rows by `ocid` when present (else keyed `portal-<id>`). Once the full
-  sweep completes the cursor flips to `completed` and subsequent runs only
-  refresh status=1 (active). Pass `?reset=true` to restart the full sweep.
+  statuses: advertised/awarded/closed/cancelled). A single call now loops
+  in-process (up to ~250s) making as many ~10k-record chunks of progress as
+  fit in one task invocation, persisting `(statusId, start)` in the `portal`
+  cursor after every chunk — so it self-drives much further per trigger than
+  before, and only falls back to a fire-and-forget self-chained follow-up
+  request if the time budget runs out before the sweep finishes. The
+  `fetchPortalPage` client itself retries transient upstream 500s (observed on
+  deep pagination offsets) 3x with backoff, and a page failure no longer fails
+  the whole cursor if the run already made partial progress — it just stops
+  this invocation's loop and lets the next trigger resume from where it left
+  off. The hourly `sync-portal` Coolify task is therefore both how the sweep
+  is driven to completion AND the safety net that resumes it if a run ever
+  does hard-fail. Rows merge with OCDS rows by `ocid` when present (else keyed
+  `portal-<id>`). Once the full sweep completes the cursor flips to
+  `completed` and subsequent runs only refresh status=1 (active). Pass
+  `?reset=true` to restart the full sweep.
 - **`status`** — read-only diagnostics: returns `tenders`/`documents` counts,
   a `by_status` breakdown, and every sync cursor. Writes nothing.
-- **`documents`** — walks the **entire** tenders table (paged) and queues OCDS
-  document URLs from `tender.documents[]`, `awards[*].documents[]` and
-  `contracts[*].documents[]` into `tender_documents` as `download_status='pending'`.
-  De-duped against existing rows, so it is idempotent and safe to re-run.
-  Returns `{ queued, scanned }`.
+- **`documents`** — walks the **entire** tenders table (paged) and queues
+  document URLs from both sources in a single pass: OCDS `tender.documents[]`,
+  `awards[*].documents[]`, `contracts[*].documents[]` (`ocds_data`), and portal
+  `supportDocument[]` entries (`raw_portal_data`), built into the confirmed
+  download URL `https://www.etenders.gov.za/home/Download/?blobName=<supportDocumentID><extension>&downloadedFileName=<fileName>`.
+  All queued into `tender_documents` as `download_status='pending'`, de-duped
+  against existing rows, so it is idempotent and safe to re-run. Note: the
+  portal only populates `supportDocument[]` for status=active and
+  status=cancelled records in practice — awarded/closed portal tenders have
+  been observed with no documents attached at the source, which is a data
+  limitation, not a sync bug. Returns `{ queued, scanned }`.
 - **`download`** — fetches up to `DOWNLOAD_BATCH` (200, override with `?limit=`)
   pending documents into the private Supabase Storage bucket via the
   `DocumentDownloader` (10-way concurrency, 3 retries, Referer set for
