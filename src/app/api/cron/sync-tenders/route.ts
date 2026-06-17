@@ -178,13 +178,24 @@ export async function upsertReleases(
 ): Promise<UpsertStats> {
   const fetched = releases.length;
 
-  // De-dup within the batch (last release for an ocid wins) and drop ocid-less rows.
-  const byOcid = new Map<string, ReturnType<typeof mapReleaseToTender>>();
+  // De-dup within the batch and drop ocid-less rows. An ocid can appear in
+  // several releases (tender -> award -> contract); the API returns them
+  // newest-first, so we must keep the LATEST-dated release per ocid rather than
+  // whichever happens to come last in the array — otherwise an older "tender"
+  // release overwrites a newer "award"/"contract" one and the status wrongly
+  // reverts to "active".
+  const byOcid = new Map<
+    string,
+    { row: ReturnType<typeof mapReleaseToTender>; date: number }
+  >();
   for (const release of releases) {
     const row = mapReleaseToTender(release);
-    if (row.ocid) byOcid.set(row.ocid, row);
+    if (!row.ocid) continue;
+    const date = release.date ? Date.parse(release.date) : 0;
+    const prev = byOcid.get(row.ocid);
+    if (!prev || date >= prev.date) byOcid.set(row.ocid, { row, date });
   }
-  const rows = [...byOcid.values()];
+  const rows = [...byOcid.values()].map((v) => v.row);
   if (rows.length === 0) return { fetched, newCount: 0, updatedCount: 0 };
 
   const ocids = [...byOcid.keys()];
@@ -231,9 +242,13 @@ async function runIncremental(
 ): Promise<RunStats> {
   const cursor = await readCursor(supabase, cursorMode);
   // OCDS requires both bounds: dateFrom = cursor high-water mark, dateTo = today.
-  const dateFrom = toOCDSDate(
-    cursor?.last_synced_date ? new Date(cursor.last_synced_date) : new Date("2020-01-01T00:00:00Z"),
-  );
+  // Subtract a 2-day look-back so releases published just after a previous run
+  // (or back-dated by the publisher) are never skipped between daily runs.
+  // Re-fetched rows are idempotent upserts.
+  const cursorDate = cursor?.last_synced_date
+    ? new Date(cursor.last_synced_date)
+    : new Date("2020-01-01T00:00:00Z");
+  const dateFrom = toOCDSDate(new Date(cursorDate.getTime() - 2 * 24 * 60 * 60 * 1000));
   const dateTo = toOCDSDate(new Date());
 
   await writeCursor(supabase, cursorMode, { status: "running" });
@@ -586,23 +601,43 @@ export async function GET(req: NextRequest) {
   const supabase = createServiceClient();
   const startTime = new Date();
 
-  // Lightweight diagnostics: row counts + cursor state. Use this to confirm the
-  // schema is in place and watch sync progress (e.g. ?mode=status).
+  // Lightweight diagnostics: row counts + status breakdown + cursor state.
+  // Use this to confirm schema and watch sync progress (e.g. ?mode=status).
   if (mode === "status") {
-    const [{ count: tenders }, { count: documents }, { data: cursors }] =
-      await Promise.all([
-        supabase.from("tenders").select("*", { count: "exact", head: true }),
-        supabase.from("tender_documents").select("*", { count: "exact", head: true }),
-        supabase
-          .from("ocds_sync_cursor")
-          .select("sync_mode, last_synced_date, last_page_number, total_records, status")
-          .order("sync_mode"),
-      ]);
+    const STATUSES = ["active", "awarded", "cancelled", "contract_signed"];
+    const headCount = (q: ReturnType<SupabaseClient["from"]>) =>
+      q.select("*", { count: "exact", head: true });
+    const [
+      { count: tenders },
+      { count: documents },
+      { count: docsDownloaded },
+      { count: docsPending },
+      { data: cursors },
+      statusCounts,
+    ] = await Promise.all([
+      headCount(supabase.from("tenders")),
+      headCount(supabase.from("tender_documents")),
+      headCount(supabase.from("tender_documents")).eq("download_status", "downloaded"),
+      headCount(supabase.from("tender_documents")).eq("download_status", "pending"),
+      supabase
+        .from("ocds_sync_cursor")
+        .select("sync_mode, last_synced_date, last_page_number, total_records, status")
+        .order("sync_mode"),
+      Promise.all(
+        STATUSES.map(async (s) => {
+          const { count } = await headCount(supabase.from("tenders")).eq("status", s);
+          return [s, count ?? 0] as const;
+        }),
+      ),
+    ]);
     return NextResponse.json({
       success: true,
       mode: "status",
       tenders: tenders ?? 0,
+      by_status: Object.fromEntries(statusCounts),
       documents: documents ?? 0,
+      docs_downloaded: docsDownloaded ?? 0,
+      docs_pending: docsPending ?? 0,
       cursors: cursors ?? [],
       now: new Date().toISOString(),
     });
