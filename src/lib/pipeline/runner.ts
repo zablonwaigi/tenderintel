@@ -1,12 +1,14 @@
 import { createServiceClient } from "@/lib/supabase/server";
-import { PortalIngester } from "./portalIngester";
 import { OcdsIngester } from "./ocdsIngester";
 import { DocumentDownloader } from "./documentDownloader";
 
-// All portal status IDs: 1=active, 2=awarded, 4=closed
-// statusId 3 (cancelled) is intentionally skipped — portal has a duplicate-key bug;
-// cancelled tenders are covered by the OCDS API path instead.
-const ALL_PORTAL_STATUSES = [1, 2, 4];
+// NOTE (Phase 0 / task 0.9 — demote portal scraping, decision RB1):
+// The legacy PortalIngester POSTed to /Home/PaginatedTenderOpportunities, which
+// now returns HTTP 405 (the endpoint only accepts GET with DataTables params).
+// It is no longer invoked here. The OCDS API is the ingestion spine, and the
+// full portal catalogue is handled by the GET-based portal-client used by the
+// `sync-tenders?mode=portal` cron. These dashboard/pipeline modes now run the
+// OCDS + document paths only, so nothing loops on the dead 405 endpoint.
 
 export type PipelineMode =
     | "full"        // all portal statuses + full OCDS history back to 2010 + all documents
@@ -67,18 +69,7 @@ export async function executeRun(runId: string, mode: PipelineMode): Promise<voi
 
   try {
         if (mode === "full") {
-                // ── 1. Ingest ALL portal statuses: active, awarded, closed ──────────
-          const portal = new PortalIngester();
-                for (const statusId of ALL_PORTAL_STATUSES) {
-                          console.log(`[runner] Starting portal ingest for statusId=${statusId}`);
-                          const r = await portal.ingestAll({ statusId });
-                          stats.tenders_fetched += r.fetched;
-                          stats.tenders_updated += r.updated;
-                          stats.docs_queued += r.documentsQueued;
-                          console.log(`[runner] statusId=${statusId} done: fetched=${r.fetched} updated=${r.updated} docs=${r.documentsQueued}`);
-                }
-
-          // ── 2. Full OCDS history (2010 → today) for cancelled + enrichment ──
+                // Portal scraping demoted (RB1/0.9): OCDS full history + downloads only.
           console.log("[runner] Starting full OCDS history ingest...");
                 const ocds = new OcdsIngester();
                 const ocdsResult = await ocds.ingestFullHistory((window, res) => {
@@ -87,7 +78,6 @@ export async function executeRun(runId: string, mode: PipelineMode): Promise<voi
                 stats.tenders_fetched += ocdsResult.fetched;
                 stats.tenders_updated += ocdsResult.upserted;
 
-          // ── 3. Download ALL pending documents (no cap) ───────────────────────
           console.log("[runner] Starting document downloads (full)...");
                 const downloader = new DocumentDownloader();
                 const dl = await downloader.downloadPending(10000);
@@ -96,13 +86,7 @@ export async function executeRun(runId: string, mode: PipelineMode): Promise<voi
                 console.log(`[runner] Documents: downloaded=${dl.downloaded} failed=${dl.failed}`);
 
         } else if (mode === "incremental") {
-                // ── Daily: active tenders + recent OCDS + pending documents ─────────
-          const portal = new PortalIngester();
-                const r = await portal.ingestAll({ statusId: 1 }); // active only
-          stats.tenders_fetched += r.fetched;
-                stats.tenders_updated += r.updated;
-                stats.docs_queued += r.documentsQueued;
-
+                // Recent OCDS + pending documents (portal active sync demoted, RB1/0.9).
           const ocds = new OcdsIngester();
                 const ocdsResult = await ocds.ingestRecent(30);
                 stats.tenders_fetched += ocdsResult.fetched;
@@ -113,21 +97,14 @@ export async function executeRun(runId: string, mode: PipelineMode): Promise<voi
                 stats.docs_downloaded += dl.downloaded;
                 stats.docs_failed += dl.failed;
 
-        } else if (mode === "awarded") {
-                // ── Weekly: awarded tenders ──────────────────────────────────────────
-          const portal = new PortalIngester();
-                const r = await portal.ingestAll({ statusId: 2 });
-                stats.tenders_fetched += r.fetched;
-                stats.tenders_updated += r.updated;
-                stats.docs_queued += r.documentsQueued;
-
-        } else if (mode === "closed") {
-                // ── Weekly: closed tenders ───────────────────────────────────────────
-          const portal = new PortalIngester();
-                const r = await portal.ingestAll({ statusId: 4 });
-                stats.tenders_fetched += r.fetched;
-                stats.tenders_updated += r.updated;
-                stats.docs_queued += r.documentsQueued;
+        } else if (mode === "awarded" || mode === "closed") {
+                // Awarded/closed tenders now come from OCDS release tags via the
+                // `sync-tenders` cron, not portal scraping (RB1/0.9). No-op here so a
+                // legacy dashboard/pipeline trigger doesn't hit the dead 405 endpoint.
+          console.warn(
+                  `[runner] mode='${mode}' is deprecated; awarded/closed are ingested ` +
+                  `from OCDS by the sync-tenders cron. Skipping legacy portal scrape.`,
+                );
 
         } else if (mode === "ocds") {
                 // ── Recent OCDS only (last 30 days) ──────────────────────────────────
