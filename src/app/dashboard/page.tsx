@@ -65,10 +65,19 @@ export default async function DashboardPage() {
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-8">
-      <h1 className="text-2xl font-bold text-gray-900">Admin Dashboard</h1>
-      <p className="mt-1 text-sm text-gray-600">
-        Pipeline control and ingestion status. Internal use.
-      </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Admin Dashboard</h1>
+          <p className="mt-1 text-sm text-gray-600">
+            Pipeline control and ingestion status. Internal use.
+          </p>
+        </div>
+        <form action="/api/auth/signout" method="post">
+          <Button type="submit" variant="secondary">
+            Sign out
+          </Button>
+        </form>
+      </div>
 
       {/* Stat cards */}
       <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">

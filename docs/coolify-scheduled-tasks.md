@@ -51,6 +51,15 @@ environment variable. Each task command therefore sends:
 -H "Authorization: Bearer TndrInt3l2026SecureCOrnJ0bK3ylZA"
 ```
 
+> **Auth note (Phase 0 / tasks 0.1, 0.4):** the cron routes under `/api/cron/*`
+> are unaffected — they keep this `CRON_SECRET` bearer check. The new
+> `src/middleware.ts` additionally gates `/dashboard` and `/api/pipeline/*`
+> behind a **staff Supabase session** (redirect to `/login` for pages, `401` for
+> the APIs). `/api/pipeline/*` also still accepts the `CRON_SECRET` bearer, so any
+> automated trigger keeps working. `/api/tenders*` stays public but is rate
+> limited to 60 requests/min/IP. Provision staff accounts in Supabase Studio →
+> Authentication and disable public sign-ups.
+
 > The container timeout is **300s**. Every mode is capped (page limits / single
 > month-window per invocation) so a run finishes well inside that budget.
 
