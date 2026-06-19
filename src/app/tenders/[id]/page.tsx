@@ -27,7 +27,13 @@ export async function generateMetadata({ params }: PageProps) {
 export default async function TenderDetailPage({ params }: PageProps) {
   const tenderId = decodeURIComponent(params.id);
 
-  const tender = await getTenderWithDocuments(tenderId).catch(() => null);
+  const tender = await getTenderWithDocuments(tenderId).catch((err) => {
+    // A real query/schema error (vs. a genuine not-found) should be visible in
+    // logs rather than silently masked as a 404 — that masking is what hid the
+    // missing ai_compliance column behind a blank 404 page.
+    console.error(`[tenders/[id]] getTenderWithDocuments(${tenderId}) failed:`, err);
+    return null;
+  });
   if (!tender) notFound();
 
   const related = (await getRelatedTenders(tenderId, tender.category).catch(
