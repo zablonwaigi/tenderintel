@@ -16,6 +16,7 @@ export function Footer() {
           <div>
             <h4 className="text-sm font-semibold text-gray-900">Platform</h4>
             <ul className="mt-3 space-y-2 text-sm text-gray-600">
+              <li><Link href="/workspace" className="hover:text-sa-green">My Workspace</Link></li>
               <li><Link href="/tenders" className="hover:text-sa-green">Browse Tenders</Link></li>
               <li><Link href="/wiki" className="hover:text-sa-green">Tender Wiki</Link></li>
               <li><Link href="/learn" className="hover:text-sa-green">Learning Hub</Link></li>
@@ -36,9 +37,17 @@ export function Footer() {
             </p>
           </div>
         </div>
-        <div className="mt-8 border-t border-gray-200 pt-6 text-xs text-gray-500">
-          © {new Date().getFullYear()} TenderIntel. Not affiliated with the Government of South Africa.
-          Always verify details against the official eTenders portal.
+        <div className="mt-8 space-y-2 border-t border-gray-200 pt-6 text-xs text-gray-500">
+          <p>
+            Tender match scores and AI summaries are decision-support only — they do not
+            guarantee eligibility or award. Tender data shared with National Treasury may not be a
+            complete record of all procurement processes. Always verify every detail against the
+            official eTenders documents before bidding.
+          </p>
+          <p>
+            © {new Date().getFullYear()} TenderIntel by GrowYourBiz. Not affiliated with the
+            Government of South Africa.
+          </p>
         </div>
       </div>
     </footer>
