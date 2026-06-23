@@ -8,6 +8,35 @@
 const fs = require("fs");
 const path = require("path");
 
+// Connect with a sensible SSL fallback for self-hosted Postgres. Internal /
+// self-hosted databases usually have NO SSL, so try non-SSL first (unless the
+// URL explicitly requests SSL via sslmode), then fall back to SSL. A short
+// connect timeout makes a bad/unreachable DB fail fast instead of hanging the
+// container entrypoint.
+async function connectWithFallback(Client, connectionString) {
+  const isLocal = /@(localhost|127\.0\.0\.1)[:/]/.test(connectionString);
+  const wantsSsl = /sslmode=(require|verify-ca|verify-full)/i.test(connectionString);
+  const sslAttempts = isLocal
+    ? [false]
+    : wantsSsl
+      ? [{ rejectUnauthorized: false }, false]
+      : [false, { rejectUnauthorized: false }];
+
+  let lastErr;
+  for (const ssl of sslAttempts) {
+    const client = new Client({ connectionString, ssl, connectionTimeoutMillis: 8000 });
+    try {
+      await client.connect();
+      return client;
+    } catch (err) {
+      lastErr = err;
+      try { await client.end(); } catch {}
+      console.warn(`  connect attempt (ssl=${ssl ? "on" : "off"}) failed: ${err.message}`);
+    }
+  }
+  throw lastErr;
+}
+
 async function main() {
   const connectionString = process.env.SUPABASE_DB_URL;
   if (!connectionString) {
@@ -34,11 +63,7 @@ async function main() {
     return;
   }
 
-  const client = new Client({
-    connectionString,
-    ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
-  });
-  await client.connect();
+  const client = await connectWithFallback(Client, connectionString);
   console.log("Connected to database.");
 
   try {
