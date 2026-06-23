@@ -7,7 +7,7 @@
 # migration degrades the workspace feature, it does not cause an outage.
 if [ -n "$SUPABASE_DB_URL" ]; then
   echo "[entrypoint] Applying database migrations..."
-  if node scripts/migrate.js; then
+  if NODE_PATH=/migrate/node_modules node scripts/migrate.js; then
     echo "[entrypoint] Migrations OK."
   else
     echo "[entrypoint] WARNING: migrations failed — starting server anyway (existing schema). See error above."

@@ -25,13 +25,17 @@ COPY --from=builder /app/.next/static ./.next/static
 
 # DB migration tooling. Migrations run automatically at container START via the
 # entrypoint (scripts/docker-entrypoint.sh), BEFORE the server boots, using the
-# runtime SUPABASE_DB_URL. This runs inside the new image (which has the new
-# migrations), unlike a Coolify pre-deployment command which runs in the OLD
-# container. The standalone output does not bundle `pg` (a devDependency not
-# imported by the app), so install it here; it is pure JS and adds ~1 MB.
+# runtime SUPABASE_DB_URL. The standalone output ships a special, traced
+# node_modules layout, so installing `pg` into it is unreliable. Instead install
+# the driver in an ISOLATED dir (/migrate) and expose it to migrate.js via
+# NODE_PATH (set in the entrypoint). The final node -e check FAILS THE BUILD if
+# pg can't be resolved, so a missing driver can never reach production silently.
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/supabase ./supabase
-RUN npm install pg@8.13.0 --no-save --no-audit --no-fund
+RUN mkdir -p /migrate && cd /migrate \
+ && npm init -y >/dev/null 2>&1 \
+ && npm install pg@8.13.0 --no-audit --no-fund \
+ && node -e "require('pg'); console.log('pg resolved OK')"
 
 EXPOSE 3000
 
