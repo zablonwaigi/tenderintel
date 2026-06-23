@@ -23,16 +23,17 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 
-# DB migration tooling so the image can migrate itself. Configure a Coolify
-# "Pre-deployment Command" of:  node scripts/migrate.js
-# with SUPABASE_DB_URL set in the resource's environment. The standalone output
-# does not bundle `pg` (a devDependency, not imported by the app), so install it
-# here; it is pure JS and adds ~1 MB.
+# DB migration tooling. Migrations run automatically at container START via the
+# entrypoint (scripts/docker-entrypoint.sh), BEFORE the server boots, using the
+# runtime SUPABASE_DB_URL. This runs inside the new image (which has the new
+# migrations), unlike a Coolify pre-deployment command which runs in the OLD
+# container. The standalone output does not bundle `pg` (a devDependency not
+# imported by the app), so install it here; it is pure JS and adds ~1 MB.
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/supabase ./supabase
 RUN npm install pg@8.13.0 --no-save --no-audit --no-fund
 
 EXPOSE 3000
 
-
-CMD ["node", "server.js"]
+# Apply pending migrations, then start the standalone server.
+CMD ["sh", "/app/scripts/docker-entrypoint.sh"]

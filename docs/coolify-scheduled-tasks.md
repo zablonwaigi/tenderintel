@@ -2,10 +2,12 @@
 
 ## ⚠️ Database migrations are now automated
 
-Migrations apply automatically on every deploy via a Coolify **pre-deployment
-command** (`node scripts/migrate.js`). See **`docs/automated-migrations.md`** for
-the one-time setup (set `SUPABASE_DB_URL` in Coolify + the pre-deploy command).
-Once configured, every `git push` → Coolify build → migrations apply → release.
+Migrations apply automatically on every deploy. The container runs them at
+**startup** (via `scripts/docker-entrypoint.sh`) before the server boots — NOT via
+Coolify's pre-deployment command, which runs in the old container and can't see a
+new image's migrations. See **`docs/automated-migrations.md`** for the one-time
+setup (just set `SUPABASE_DB_URL` in Coolify; leave the pre-deployment command
+empty). Once configured, every `git push` → Coolify build → migrations apply → release.
 
 The sync upserts on `tenders.ocid` and queues documents — both need schema that
 the `20260616000002_ocds_sync_rewrite.sql` migration creates. With automation in
