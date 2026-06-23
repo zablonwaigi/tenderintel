@@ -1,21 +1,21 @@
 # Coolify Scheduled Tasks
 
-## ⚠️ REQUIRED FIRST: apply the database migration
+## ⚠️ Database migrations are now automated
+
+Migrations apply automatically on every deploy via a Coolify **pre-deployment
+command** (`node scripts/migrate.js`). See **`docs/automated-migrations.md`** for
+the one-time setup (set `SUPABASE_DB_URL` in Coolify + the pre-deploy command).
+Once configured, every `git push` → Coolify build → migrations apply → release.
 
 The sync upserts on `tenders.ocid` and queues documents — both need schema that
-the `20260616000002_ocds_sync_rewrite.sql` migration creates. If it has **not**
-been applied, every write fails with:
-
-> `there is no unique or exclusion constraint matching the ON CONFLICT specification`
-
-…and the table stays frozen (the "stuck at 245" symptom). Apply it once:
+the `20260616000002_ocds_sync_rewrite.sql` migration creates. With automation in
+place this is applied for you. To apply by hand instead (one-off):
 
 ```bash
-# Option A — from the repo (needs the Postgres connection string)
+# From the repo (needs the Postgres connection string)
 SUPABASE_DB_URL="postgres://...supabase.co:5432/postgres" npm run db:migrate
 
-# Option B — paste supabase/migrations/20260616000002_ocds_sync_rewrite.sql
-#            into the Supabase SQL Editor and run it.
+# …or paste the SQL file into the Supabase SQL Editor and run it.
 ```
 
 Verify with the diagnostics endpoint (no data written, just reports state):

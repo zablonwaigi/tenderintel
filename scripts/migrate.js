@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 /* eslint-disable */
-// Apply all SQL files in supabase/migrations to the database in order.
+// Apply pending SQL files in supabase/migrations to the database, in order,
+// exactly once each. Tracks applied files in a `schema_migrations` table so it
+// is safe to run on every deploy / push.
+//
 // Usage: SUPABASE_DB_URL=postgres://... node scripts/migrate.js
 const fs = require("fs");
 const path = require("path");
@@ -39,13 +42,51 @@ async function main() {
   console.log("Connected to database.");
 
   try {
+    // Ledger of applied migrations. IF NOT EXISTS keeps this safe on a DB that
+    // already had migrations applied manually — those files are idempotent
+    // (CREATE/ALTER ... IF NOT EXISTS), so re-applying them once to register
+    // them in the ledger is harmless.
+    await client.query(
+      `create table if not exists public.schema_migrations (
+         filename   text primary key,
+         applied_at timestamptz not null default now()
+       );`
+    );
+
+    const { rows } = await client.query("select filename from public.schema_migrations;");
+    const applied = new Set(rows.map((r) => r.filename));
+
+    let appliedCount = 0;
     for (const file of files) {
+      if (applied.has(file)) {
+        console.log(`  • ${file} (already applied, skipped)`);
+        continue;
+      }
       const sql = fs.readFileSync(path.join(dir, file), "utf8");
       console.log(`Applying ${file} ...`);
-      await client.query(sql);
-      console.log(`  ✓ ${file}`);
+      // Each migration runs atomically: the file + its ledger insert commit
+      // together, or roll back together.
+      try {
+        await client.query("begin");
+        await client.query(sql);
+        await client.query(
+          "insert into public.schema_migrations(filename) values ($1) on conflict do nothing;",
+          [file]
+        );
+        await client.query("commit");
+        appliedCount++;
+        console.log(`  ✓ ${file}`);
+      } catch (err) {
+        await client.query("rollback");
+        throw new Error(`${file}: ${err.message}`);
+      }
     }
-    console.log("All migrations applied successfully.");
+
+    console.log(
+      appliedCount === 0
+        ? "Database already up to date — no migrations applied."
+        : `Done — applied ${appliedCount} migration(s).`
+    );
   } finally {
     await client.end();
   }
