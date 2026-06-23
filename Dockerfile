@@ -17,6 +17,11 @@ ENV NODE_ENV=production
 RUN apk add --no-cache wget curl
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
+# Next.js standalone binds to $HOSTNAME, which Docker sets to the container ID —
+# so the server listens on the container's hostname, not 127.0.0.1, and a
+# healthcheck hitting http://localhost:3000 is refused. Bind all interfaces so
+# the in-container healthcheck (curl/wget localhost) works.
+ENV HOSTNAME=0.0.0.0
 
 # Copy the standalone server output
 COPY --from=builder /app/public ./public
