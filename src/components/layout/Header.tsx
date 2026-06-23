@@ -5,7 +5,6 @@ const NAV = [
   { href: "/tenders", label: "Tenders" },
   { href: "/wiki", label: "Wiki" },
   { href: "/learn", label: "Learn" },
-  { href: "/dashboard", label: "Dashboard" },
 ];
 
 export function Header() {
@@ -26,11 +25,17 @@ export function Header() {
             <Link
               key={item.href}
               href={item.href}
-              className="rounded-lg px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 hover:text-sa-green"
+              className="hidden rounded-lg px-3 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 hover:text-sa-green sm:inline-block"
             >
               {item.label}
             </Link>
           ))}
+          <Link
+            href="/workspace"
+            className="ml-1 rounded-lg bg-sa-green px-3 py-2 text-sm font-semibold text-white transition-colors hover:bg-sa-green/90"
+          >
+            My Workspace
+          </Link>
         </nav>
       </div>
     </header>

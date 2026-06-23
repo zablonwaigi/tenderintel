@@ -85,7 +85,17 @@ export async function middleware(req: NextRequest) {
     return user ? res : unauthorized();
   }
 
-  // 3. Dashboard pages — staff session, else redirect to /login.
+  // 3. Client workspace — any authenticated user, else send to /signup.
+  if (pathname.startsWith("/workspace")) {
+    const { res, user } = await resolveUser(req);
+    if (user) return res;
+    const url = req.nextUrl.clone();
+    url.pathname = "/signup";
+    url.searchParams.set("redirect", pathname);
+    return NextResponse.redirect(url);
+  }
+
+  // 4. Dashboard pages — staff session, else redirect to /login.
   if (pathname.startsWith("/dashboard")) {
     const { res, user } = await resolveUser(req);
     if (user) return res;
@@ -99,5 +109,10 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/api/pipeline/:path*", "/api/tenders/:path*"],
+  matcher: [
+    "/dashboard/:path*",
+    "/workspace/:path*",
+    "/api/pipeline/:path*",
+    "/api/tenders/:path*",
+  ],
 };

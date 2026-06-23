@@ -5,11 +5,11 @@ import { Footer } from "@/components/layout/Footer";
 
 export const metadata: Metadata = {
   title: {
-    default: "TenderIntel — South African Government Tender Intelligence",
+    default: "TenderIntel — Match your business to SA government tenders",
     template: "%s · TenderIntel",
   },
   description:
-    "Find, understand and win South African government tenders. Search 150,000+ tenders, download documents, and learn the SBD/MBD forms.",
+    "TenderIntel by GrowYourBiz helps South African SMMEs match their company profile to live government tenders, understand requirements in plain English, track deadlines, and prepare bid packs.",
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "https://growyourbizsa.co.za"),
 };
 
