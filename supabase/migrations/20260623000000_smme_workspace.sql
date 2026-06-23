@@ -13,6 +13,18 @@
 -- client reads.
 -- ============================================
 
+-- ---------- updated_at helper ----------
+-- Normally created by the init migration, but production drifted and may lack
+-- it (audit finding). Define it here idempotently so this migration is
+-- self-contained and never fails on a missing function.
+create or replace function public.handle_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
 -- ---------- profiles: bridge auth.users -> role ----------
 create table if not exists public.profiles (
   id          uuid primary key references auth.users(id) on delete cascade,
